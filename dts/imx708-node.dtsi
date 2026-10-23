@@ -1,0 +1,38 @@
+// IMX708 设备树参考片段（Luckfox Pico Zero / RV1106，BSP 5.10.160）
+// 应用位置：arch/arm/boot/dts/rv1106-luckfox-pico-zero-ipc.dtsi
+// 注意：同一 MIPI 链路上的其他传感器节点（imx415@37 等）必须 status = "disabled"，
+//       否则 async notifier 图不完备（PieSoft 文中坑，我们同样验证）。
+
+/ {
+	/* 24MHz 固定时钟（与 imx415 的 out_osc_imx415 同层放置） */
+	out_osc_imx708: out-osc-imx708 {
+		compatible = "fixed-clock";
+		clock-output-names = "out-osc-imx708";
+		clock-frequency = <24000000>;
+		#clock-cells = <0>;
+	};
+};
+
+&i2c4 {
+	imx708: imx708@1a {
+		compatible = "sony,imx708";
+		status = "okay";
+		reg = <0x1a>;
+		clocks = <&out_osc_imx708>;
+		clock-names = "xvclk";		/* 驱动按此名取时钟 */
+		reset-gpios = <&gpio3 RK_PC5 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_io_1>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "Raspberry Pi Camera Module 3";
+		rockchip,camera-module-lens-name = "TNBA1392";
+		port {
+			imx708_out: endpoint {
+				remote-endpoint = <&imx708_csi_input>;
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <450000000>;
+			};
+		};
+	};
+};

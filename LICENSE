@@ -1,0 +1,9 @@
+MIT License? 不适用——本仓库主体为内核驱动代码。
+
+内核驱动（driver/imx708.c）：GPL-2.0（上游 Linux 内核许可，无附加条款）。
+设备树片段（dts/）：GPL-2.0 或 BSD-2-Clause 双许可，随内核树惯例。
+文档（*.md）：CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）
+
+引用来源：
+- 驱动骨架：armbian/linux-rockchip PR#457（GPL-2.0）
+- 寄存器表源：raspberrypi/linux drivers/media/i2c/imx708.c（GPL-2.0）
