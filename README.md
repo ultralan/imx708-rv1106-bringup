@@ -241,7 +241,9 @@ Even with a working reference, board-level facts remain yours to verify:
 ```
 imx708-rv1106-bringup/
 ├── README.md            # this document
+├── af/                  # Part 3: autofocus system (host daemon + board C agent + tester)
 ├── driver/imx708.c      # final driver (Rockchip skeleton + board-proven register table, 5.10.160)
+├── driver/patches/      # af_snap RAWAF debugfs patch
 └── dts/imx708-node.dtsi # reference DTS fragment: sensor node + 24 MHz fixed clock
 ```
 
@@ -258,6 +260,104 @@ auto convergence), RTSP 2304×1296 + restream stable. Not yet done: autofocus
 (DW9807 VCM node + `CONFIG_VIDEO_DW9807_VCM` + IQ `af_v31 contrast_af.enable`),
 auto AWB tuning. One observed kernel-side ISP stall on stream stop
 (`rkisp_stream_stop timeout`, recovered by reboot) — trigger not yet isolated.
+
+## Part 3: Autofocus — three architectures in one day
+
+2026-10-30. With the 3A loop stable, autofocus was the last missing piece.
+The module carries a DW9800W-variant VCM at address `0x0c` (chip ID register
+`0x00` reads `0xEB`, not the `0xF2` of genuine Dongwoon parts). The day went
+through three architectures; the final one is what ships.
+
+**The VCM control one-liner** (after a full day of "the lens is dead"):
+
+```
+i2ctransfer -y -f 4 w3@0x0c 0x03 <MSB-decimal> <LSB-decimal>
+```
+
+Busybox `i2ctransfer` **only accepts decimal** data bytes. Our first daemon
+formatted DAC values as hex (`:02x`); every DAC value containing an a–f digit
+silently failed, and the daemon happily continued on stale readings. This
+single bug masqueraded as, in order: "the lens is stuck", "the VCM drifted",
+"the VCM is broken", "the chip is fried". We nearly binned two healthy
+modules over it. Check your tool's return codes.
+
+**Architecture v3.1** (all three stages ran the same day):
+
+1. **Image-space CDAF** — grab RTSP frames, Laplacian, hill-climb. Locked in
+   60s, oscillated forever: RTSP buffering means the frame you score is
+   always frames behind the lens position you just wrote. The lag is the
+   oscillation.
+2. **RAWAF hardware stats** — the RV1106 ISP computes a 225-zone RawAF grid;
+   a tiny kernel patch (`driver/patches/afsnap-rawaf-debugfs.patch`) snapshots
+   it to `/sys/kernel/debug/rkisp_af/stats`. 50ms per sample, no RTSP
+   involved, 4.6× peak/valley discrimination. Locked in 6s. Two landmines:
+   - The af_snap fill runs in the ISP **hard-IRQ context** — the first patch
+     used a mutex and hard-locked the SoC under load (spin_lock_irqsave
+     fixes it). Sleeping locks in IRQ context hard-lock silently.
+   - The RAWAF level couples to AE gain and scene texture. **Absolute
+     levels mean nothing across scenes**; only the peak/valley *structure*
+     within one sweep carries focus information.
+3. **On-board agent** (final) — a small C daemon on the board owns `/dev/i2c-4`
+   and the stats file directly (`af/af_agent_c.c`); the host speaks a
+   line protocol over one SSH connection. Zero process spawns per sample:
+   **145ms per move+measure**, full-range sweep + lock in **~1s**,
+   defocus recovery ~1s. The C agent also carries the **center-weighted**
+   statistics (center 5×5 grid = 1.0, mid-ring 0.2, outer 0.02) — corner
+   textures were hijacking the focus decision.
+
+**Other traps hit on the way** (Part 3 continuation of the silent-trap list):
+
+- `launchd`'s KeepAlive resurrects the daemon 30s after any kill. A hardware
+  A/B experiment run while the daemon is alive measures *the daemon*, not the
+  hardware. Bootout the service before touching hardware.
+- The lens **controller** and the **AE** are coupled through the ISP: raising
+  IQ `sharp_ratio` 10→15 changed the statistics the AE sees and blew the
+  exposure. Any IQ edit must be verified against brightness *and* clarity.
+- `rkipc` (via rockit) holds every rkcif channel's buffer queue. A second
+  v4l2 opener of `stream_cif_mipi_id1` gets EBUSY forever; killing rkipc
+  just gets you a watchdog restart. Embedding data (PDAF) therefore has **no
+  zero-change path** under rkipc.
+- The MAC-side pipeline reader must `select()` with a timeout. A half-dead
+  SSH pipe (TCP alive, peer wedged) blocks `readline()` forever at 0% CPU —
+  the daemon looks alive and does nothing. The board-side C agent also
+  self-exits after 5s of stdin silence.
+
+**PDAF status**: the sensor transmits phase data as MIPI embedded data
+(DT `0x12`, one line, inside a 4-line metadata bundle — measured, not
+guessed). We added `RKMODULE_GET_CHANNEL_INFO` to the driver declaring pad 1
+as `EBD_1X8 5760×1`, and `stream_cif_mipi_id1` now enumerates `EBD8`. The
+remaining blocker is enabling the media link while rkipc holds the pipeline
+(see above). Data format per PieSoft's measurements: 12×16 grid, confidence
++ phase per zone, phase Q4 (divide by 16 = signed defocus in pixels).
+
+**Resolution ceiling** (confirming PieSoft): the RV1106 ISP v3.2 caps input
+at 3072×1728 (~5.3 MP, `CIF_ISP_INPUT_*_MAX_V32`), the two-pass stitching
+that lifts this on bigger Rockchips is disabled, and the IMX708 has no native
+mode between 2304 and 4608. 2304×1296@25 is the ceiling on this SoC.
+
+## Part 3 repo layout
+
+```
+├── af/afd_fast.py          # host-side daemon: sentinel + image fine-scan + adaptive hill climb
+├── af/af_agent_c.c         # board-side C agent (i2c-dev + stats, center-weighted)
+├── af/af_agent.sh          # shell agent (reference; slow, superseded)
+├── af/af_offline_test.py   # frame-library replay tester (blur/glitch injection)
+├── driver/imx708.c         # final driver (+ RKMODULE_GET_CHANNEL_INFO, EBD pad)
+└── driver/patches/afsnap-rawaf-debugfs.patch  # RAWAF → debugfs (spinlock version)
+```
+
+Deploy: `af_agent_c` runs on the board (launchd/`/userdata`), `afd_fast.py`
+runs on the host via launchd (`KeepAlive`). Point both at the board's IP.
+
+## Verified status (2026-10-30)
+
+Autofocus **working end-to-end**: sweep+lock ~1s, defocus recovery ~1s,
+center-weighted, range-limited (DAC 500–1000, user-calibrated), full
+self-healing chain (AE rescue / pipe-timeout rebuild / agent suicide /
+blackout suspend). Restream + RTSP stable. Resolution ceiling documented
+above.
+
+## (old verified status, kept for reference)
 
 ## Credits
 

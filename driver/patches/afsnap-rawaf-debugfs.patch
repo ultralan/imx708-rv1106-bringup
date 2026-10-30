@@ -1,0 +1,90 @@
+diff --git a/sysdrv/source/kernel/drivers/media/platform/rockchip/isp/isp_stats_v32.c b/sysdrv/source/kernel/drivers/media/platform/rockchip/isp/isp_stats_v32.c
+index b1d2e8fc8..c27dcd496 100644
+--- a/sysdrv/source/kernel/drivers/media/platform/rockchip/isp/isp_stats_v32.c
++++ b/sysdrv/source/kernel/drivers/media/platform/rockchip/isp/isp_stats_v32.c
+@@ -2,6 +2,8 @@
+ /* Copyright (c) 2022 Rockchip Electronics Co., Ltd. */
+ 
+ #include <linux/kfifo.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ #include <linux/rk-isp32-config.h>
+ #include <media/v4l2-common.h>
+ #include <media/v4l2-ioctl.h>
+@@ -14,6 +16,40 @@
+ #include "isp_stats_v32.h"
+ #include "isp_params_v32.h"
+ 
++/* ---- AF snapshot: expose rawaf fv grid via debugfs for external AF daemon ---- */
++static struct dentry *af_snap_dir;
++static u32 af_snap_v1[225], af_snap_v2[225], af_snap_h1[225], af_snap_h2[225];
++static u32 af_snap_sum_b, af_snap_lum_b;
++static u64 af_snap_time;
++static DEFINE_SPINLOCK(af_snap_lock);
++
++static int af_snap_show(struct seq_file *m, void *v)
++{
++	unsigned long flags;
++	int i;
++	spin_lock_irqsave(&af_snap_lock, flags);
++	seq_printf(m, "time=%llu\n", af_snap_time);
++	seq_printf(m, "sum_b=%u lum_b=%u\n", af_snap_sum_b, af_snap_lum_b);
++	for (i = 0; i < 225; i++)
++		seq_printf(m, "%u %u %u %u\n",
++			   af_snap_v1[i], af_snap_v2[i], af_snap_h1[i], af_snap_h2[i]);
++	spin_unlock_irqrestore(&af_snap_lock, flags);
++	return 0;
++}
++static int af_snap_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, af_snap_show, NULL);
++}
++
++static const struct file_operations af_snap_show_fops = {
++	.owner = THIS_MODULE,
++	.open = af_snap_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++/* ---- end AF snapshot ---- */
++
+ #define ISP32_3A_MEAS_DONE		BIT(31)
+ 
+ static void isp3_module_done(struct rkisp_isp_stats_vdev *stats_vdev,
+@@ -204,6 +240,24 @@ rkisp_stats_get_rawaf_meas_ddr(struct rkisp_isp_stats_vdev *stats_vdev,
+ 	af->int_state = isp3_stats_read(stats_vdev, ISP3X_RAWAF_INT_STATE);
+ 	af->highlit_cnt_winb = isp3_stats_read(stats_vdev, ISP3X_RAWAF_HIGHLIT_CNT_WINB);
+ 
++	/* AF snapshot for external AF daemon */
++	{
++		int idx;
++		unsigned long flags;
++		spin_lock_irqsave(&af_snap_lock, flags);
++		for (idx = 0; idx < 225 && idx < ISP32_RAWAF_SUMDATA_NUM; idx++) {
++			struct isp3x_rawaf_ramdata *rd = &af->ramdata[idx];
++			af_snap_v1[idx] = rd->v1;
++			af_snap_v2[idx] = rd->v2;
++			af_snap_h1[idx] = rd->h1;
++			af_snap_h2[idx] = rd->h2;
++		}
++		af_snap_sum_b = af->afm_sum_b;
++		af_snap_lum_b = af->afm_lum_b;
++		af_snap_time = ktime_get_ns();
++		spin_unlock_irqrestore(&af_snap_lock, flags);
++	}
++
+ out:
+ 	/* af should not clean mease done during isp working for af_ae_mode */
+ 	stats_vdev->af_meas_done_next = false;
+@@ -1131,6 +1185,10 @@ void rkisp_stats_next_ddr_config_v32(struct rkisp_isp_stats_vdev *stats_vdev)
+ 
+ void rkisp_init_stats_vdev_v32(struct rkisp_isp_stats_vdev *stats_vdev)
+ {
++	if (!af_snap_dir)
++		af_snap_dir = debugfs_create_dir("rkisp_af", NULL);
++	if (af_snap_dir && !debugfs_lookup("stats", af_snap_dir))
++		debugfs_create_file("stats", 0444, af_snap_dir, NULL, &af_snap_show_fops);
+ 	if (stats_vdev->dev->isp_ver == ISP_V32) {
+ 		stats_vdev->priv_ops = &stats_ddr_ops_v32;
+ 		stats_vdev->rd_stats_from_ddr = true;

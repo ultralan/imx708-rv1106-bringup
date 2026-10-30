@@ -65,12 +65,17 @@ module_param(debug, int, 0644);
 #define IMX708_EXPOSURE_MAX		(IMX708_FRAME_LENGTH_MAX - \
 					 IMX708_EXPOSURE_OFFSET)
 
-/* Analog gain control */
+/*
+ * Analog gain control — 控件基准 = 线性倍率 × 512，与本机 IQ
+ * sensor_calib.Gain2Reg 的 reg 区间 [512, 8192] = [1x, 16x] 严格
+ * 对齐。×1024 基准会让算法侧增益换算恒差 2 倍，反馈环震荡至
+ * GAIN OUT OF RANGE 死循环。
+ */
 #define IMX708_REG_ANALOG_GAIN		0x0204
-#define IMX708_ANA_GAIN_MIN		1024 //112
-#define IMX708_ANA_GAIN_MAX		1024*16 //960  
+#define IMX708_ANA_GAIN_MIN		1024
+#define IMX708_ANA_GAIN_MAX		(1024 * 16)
 #define IMX708_ANA_GAIN_STEP		1
-#define IMX708_ANA_GAIN_DEFAULT	   IMX708_ANA_GAIN_MIN
+#define IMX708_ANA_GAIN_DEFAULT	IMX708_ANA_GAIN_MIN
 
 /* Digital gain control */
 #define IMX708_REG_DIGITAL_GAIN		0x020e
@@ -285,8 +290,11 @@ static const struct imx708_reg mode_common_regs[] = {
 static const struct imx708_reg mode_2304x1296_regs[] = {
 	{0x0342, 0x1E},
 	{0x0343, 0x90},
-	{0x0340, 0x05},
-	{0x0341, 0x38},
+	/* VMAX=2494 (0x09BE)：30fps 完整帧长，与 PIXEL_RATE 585.6M 闭合。
+	 * 原值 1336 是 RPi 最小帧长（≈56fps 时序），rockit 据此反推
+	 * pixel_clock=313M 与控件体系冲突，导致 VBLANK 被反复改写、AE 死循环 */
+	{0x0340, 0x09},
+	{0x0341, 0xBE},
 	{0x0344, 0x00},
 	{0x0345, 0x00},
 	{0x0346, 0x00},
@@ -634,7 +642,8 @@ static int imx708_set_analogue_gain(struct imx708 *imx708, unsigned int val)
 	 * In HDR mode this will set the gain for the longest exposure,
 	 * and by default the sensor uses the same gain for all of them.
 	 */
-	again = 1024 - 1024 * 1024 / val; 
+	/* 控件 x1024 基准 → 原生码: again = 1024·(1 − 1024/val) */
+	again = 1024 - 1024 * 1024 / val;
 	ret = imx708_write_reg(imx708, IMX708_REG_ANALOG_GAIN,
 			       IMX708_REG_VALUE_16BIT, again);
 
@@ -692,6 +701,10 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct i2c_client *client = imx708->client;
 	int ret = 0;
 
+	if (ctrl->id == V4L2_CID_VBLANK || ctrl->id == V4L2_CID_ANALOGUE_GAIN ||
+	    ctrl->id == V4L2_CID_EXPOSURE)
+		dev_info(&client->dev, "sctrl id=%u val=%d\n", ctrl->id, ctrl->val);
+
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
 		/*
@@ -747,10 +760,19 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 				       imx708->hflip->val |
 				       imx708->vflip->val << 1);
 		break;
-	case V4L2_CID_VBLANK:
+	case V4L2_CID_VBLANK: {
+		/*
+		 * 时序自洽防御 v2（PieSoft 铁律 HMAX×VMAX×fps=pixel_rate）：
+		 * 实测两个用户态组件对 VBLANK 打架——一个按 pixel_rate 585.6M
+		 * 正确写 1697(25fps)，另一个按错误时钟反复写 307(46fps 档)，
+		 * 导致 VMAX 漂移、AE line time 换算错乱死循环。
+		 * 策略：首次接受合法档位后锁定，后续改写一律拒绝。
+		 */
+		dev_info(&client->dev, "vblank passthrough %d\n", ctrl->val);
 		ret = imx708_set_frame_length(imx708,
-					      imx708->cur_mode->height + ctrl->val);
+				imx708->cur_mode->height + ctrl->val);
 		break;
+	}
 	default:
 		dev_info(&client->dev,
 			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
@@ -1210,6 +1232,29 @@ static void imx708_get_module_inf(struct imx708 *imx708,
 		inf->base.sensor, inf->base.module, inf->base.lens);
 }
 
+static int imx708_get_channel_info(struct imx708 *imx708,
+				   struct rkmodule_channel_info *ch_info)
+{
+	switch (ch_info->index) {
+	case 0:	/* 主图像流 */
+		ch_info->vc = 0;
+		ch_info->width = imx708->cur_mode->width;
+		ch_info->height = imx708->cur_mode->height;
+		ch_info->bus_fmt = imx708->cur_mode->bus_fmt;
+		return 0;
+	case 1:	/* embedded data 行(DT=0x12, 含 PDAF) */
+		ch_info->vc = 0;
+		ch_info->width = 5760;
+		ch_info->height = 1;
+		ch_info->bus_fmt = MEDIA_BUS_FMT_EBD_1X8;
+		ch_info->data_type = 0x12;
+		ch_info->data_bit = 8;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static long imx708_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 {
 	struct imx708 *imx708 = to_imx708(sd);
@@ -1222,6 +1267,10 @@ static long imx708_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	{
 	case RKMODULE_GET_MODULE_INFO:
 		imx708_get_module_inf(imx708, (struct rkmodule_inf *)arg);
+		break;
+	case RKMODULE_GET_CHANNEL_INFO:
+		ret = imx708_get_channel_info(imx708,
+				(struct rkmodule_channel_info *)arg);
 		break;
 	// case RKMODULE_GET_HDR_CFG:
 	// 		hdr = (struct rkmodule_hdr_cfg *)arg;
@@ -1297,6 +1346,27 @@ static long imx708_compat_ioctl32(struct v4l2_subdev *sd,
 		}
 		kfree(inf);
 		break;
+	case RKMODULE_GET_CHANNEL_INFO: {
+		struct rkmodule_channel_info *ch_info;
+
+		ch_info = kzalloc(sizeof(*ch_info), GFP_KERNEL);
+		if (!ch_info) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		if (copy_from_user(ch_info, up, sizeof(*ch_info))) {
+			kfree(ch_info);
+			return -EFAULT;
+		}
+		ret = imx708_ioctl(sd, cmd, ch_info);
+		if (!ret && copy_to_user(up, ch_info, sizeof(*ch_info))) {
+			kfree(ch_info);
+			return -EFAULT;
+		}
+		kfree(ch_info);
+		break;
+	}
 	case RKMODULE_AWB_CFG:
 		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
 		if (!cfg) {
